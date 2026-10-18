@@ -44,5 +44,3 @@ cd cfsm-agent
 go test ./...
 go build -trimpath -o cf-probe ./cmd/cf-probe
 ```
-
-发布新版本时，在本仓库创建并发布正式 GitHub Release，例如 `v1.0.21`。Actions 会编译并上传各平台程序、校验文件及 Docker 镜像。等待构建成功后再安装。
