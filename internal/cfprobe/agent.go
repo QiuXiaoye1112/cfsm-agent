@@ -60,8 +60,8 @@ type Agent struct {
 const (
 	agentWSSModeDisabled          = "disabled"
 	agentWSSScheduleDisabled      = "wss_disabled"
-	metricsProbeInterval          = 20 * time.Second
-	metricsProbeMedianWindow      = 2 * time.Minute
+	metricsProbeInterval          = 10 * time.Second
+	metricsProbeMedianWindow      = 1 * time.Minute
 	metricsProbeWindowSampleCount = 6
 	metricsProbeSampleCount       = 1
 	configStateReportInterval     = time.Minute
@@ -125,14 +125,23 @@ func (h rollingProbeHistory) snapshot(now time.Time) ProbeResult {
 
 	cutoff := now.Add(-metricsProbeMedianWindow)
 	values := make([]int, 0, len(h.samples))
+	lossSamples := make([]timedProbeResult, 0, len(h.samples))
 	for _, sample := range h.samples {
-		if sample.at.Before(cutoff) || !sample.result.OK || sample.result.RTTMs < 0 {
+		if sample.at.Before(cutoff) {
 			continue
 		}
-		values = append(values, sample.result.RTTMs)
+		lossSamples = append(lossSamples, sample)
+		if sample.result.OK && sample.result.RTTMs >= 0 {
+			values = append(values, sample.result.RTTMs)
+		}
 	}
-
-	lossSamples := h.samples
+	if len(lossSamples) == 0 {
+		latest := h.samples[len(h.samples)-1]
+		lossSamples = []timedProbeResult{latest}
+		if latest.result.OK && latest.result.RTTMs >= 0 {
+			values = append(values, latest.result.RTTMs)
+		}
+	}
 	if len(lossSamples) > metricsProbeWindowSampleCount {
 		lossSamples = lossSamples[len(lossSamples)-metricsProbeWindowSampleCount:]
 	}
@@ -142,7 +151,7 @@ func (h rollingProbeHistory) snapshot(now time.Time) ProbeResult {
 			lost++
 		}
 	}
-	loss := lost * 100 / len(lossSamples)
+	loss := roundLossPercent(lost, len(lossSamples))
 
 	if len(values) == 0 {
 		return ProbeResult{RTTMs: -1, Loss: loss, OK: false}
@@ -574,7 +583,7 @@ func probeLossValue(node string, r ProbeResult) any {
 	if r.Loss < 0 {
 		return "100"
 	}
-	return strconv.Itoa(r.Loss)
+	return strconv.FormatFloat(r.Loss, 'f', -1, 64)
 }
 
 func (a *Agent) report(m Metrics) {
@@ -780,78 +789,94 @@ func valueOrZero[T ~int64 | ~uint64](value *T) T {
 func (a *Agent) networkWorker(ctx context.Context) {
 	var lastIP, lastProbe time.Time
 	var ctHistory, cuHistory, cmHistory, bdHistory, node1History, node2History, node3History, node4History rollingProbeHistory
-	ticker := time.NewTicker(5 * time.Second)
+	runStep := func(now time.Time) {
+		cfg := a.configSnapshot()
+		snap := ProbeSnapshot{}
+		needUpdate := false
+		if lastIP.IsZero() || now.Sub(lastIP) >= 10*time.Minute {
+			usePublicDNS := usePublicDNSResolver(cfg)
+			snap.IPv4 = lookupPublicIP("tcp4", a.log, usePublicDNS)
+			snap.IPv6 = lookupPublicIP("tcp6", a.log, usePublicDNS)
+			lastIP = now
+			needUpdate = true
+		}
+		if lastProbe.IsZero() || now.Sub(lastProbe) >= metricsProbeInterval {
+			lastProbe = now
+			probeTargets := []struct {
+				target  string
+				history *rollingProbeHistory
+				dest    *ProbeResult
+			}{
+				{cfg.CTNode, &ctHistory, &snap.CT},
+				{cfg.CUNode, &cuHistory, &snap.CU},
+				{cfg.CMNode, &cmHistory, &snap.CM},
+				{cfg.BDNode, &bdHistory, &snap.BD},
+				{cfg.Node1, &node1History, &snap.Node1},
+				{cfg.Node2, &node2History, &snap.Node2},
+				{cfg.Node3, &node3History, &snap.Node3},
+				{cfg.Node4, &node4History, &snap.Node4},
+			}
+			results := make([]ProbeResult, len(probeTargets))
+			var wg sync.WaitGroup
+			for i, item := range probeTargets {
+				wg.Add(1)
+				go func(idx int, target string) {
+					defer wg.Done()
+					results[idx] = measureProbe(cfg.PingMode, target, metricsProbeSampleCount, defaultMetricsTCPPort, a.log)
+				}(i, item.target)
+			}
+			wg.Wait()
+			for i, item := range probeTargets {
+				item.history.add(now, probeHistoryKey(cfg.PingMode, item.target), results[i])
+				*item.dest = item.history.snapshot(now)
+			}
+			needUpdate = true
+		}
+		if needUpdate {
+			a.mu.Lock()
+			if snap.IPv4 == "" {
+				snap.IPv4 = a.probes.IPv4
+			}
+			if snap.IPv6 == "" {
+				snap.IPv6 = a.probes.IPv6
+			}
+			if snap.CT == (ProbeResult{}) {
+				snap.CT = a.probes.CT
+			}
+			if snap.CU == (ProbeResult{}) {
+				snap.CU = a.probes.CU
+			}
+			if snap.CM == (ProbeResult{}) {
+				snap.CM = a.probes.CM
+			}
+			if snap.BD == (ProbeResult{}) {
+				snap.BD = a.probes.BD
+			}
+			if snap.Node1 == (ProbeResult{}) {
+				snap.Node1 = a.probes.Node1
+			}
+			if snap.Node2 == (ProbeResult{}) {
+				snap.Node2 = a.probes.Node2
+			}
+			if snap.Node3 == (ProbeResult{}) {
+				snap.Node3 = a.probes.Node3
+			}
+			if snap.Node4 == (ProbeResult{}) {
+				snap.Node4 = a.probes.Node4
+			}
+			a.probes = snap
+			a.mu.Unlock()
+		}
+	}
+	runStep(time.Now())
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			cfg := a.configSnapshot()
-			snap := ProbeSnapshot{}
-			needUpdate := false
-			if lastIP.IsZero() || now.Sub(lastIP) >= 10*time.Minute {
-				usePublicDNS := usePublicDNSResolver(cfg)
-				snap.IPv4 = lookupPublicIP("tcp4", a.log, usePublicDNS)
-				snap.IPv6 = lookupPublicIP("tcp6", a.log, usePublicDNS)
-				lastIP = now
-				needUpdate = true
-			}
-			if lastProbe.IsZero() || now.Sub(lastProbe) >= metricsProbeInterval {
-				ctHistory.add(now, probeHistoryKey(cfg.PingMode, cfg.CTNode), measureProbe(cfg.PingMode, cfg.CTNode, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				cuHistory.add(now, probeHistoryKey(cfg.PingMode, cfg.CUNode), measureProbe(cfg.PingMode, cfg.CUNode, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				cmHistory.add(now, probeHistoryKey(cfg.PingMode, cfg.CMNode), measureProbe(cfg.PingMode, cfg.CMNode, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				bdHistory.add(now, probeHistoryKey(cfg.PingMode, cfg.BDNode), measureProbe(cfg.PingMode, cfg.BDNode, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				node1History.add(now, probeHistoryKey(cfg.PingMode, cfg.Node1), measureProbe(cfg.PingMode, cfg.Node1, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				node2History.add(now, probeHistoryKey(cfg.PingMode, cfg.Node2), measureProbe(cfg.PingMode, cfg.Node2, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				node3History.add(now, probeHistoryKey(cfg.PingMode, cfg.Node3), measureProbe(cfg.PingMode, cfg.Node3, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				node4History.add(now, probeHistoryKey(cfg.PingMode, cfg.Node4), measureProbe(cfg.PingMode, cfg.Node4, metricsProbeSampleCount, defaultMetricsTCPPort, a.log))
-				snap.CT = ctHistory.snapshot(now)
-				snap.CU = cuHistory.snapshot(now)
-				snap.CM = cmHistory.snapshot(now)
-				snap.BD = bdHistory.snapshot(now)
-				snap.Node1 = node1History.snapshot(now)
-				snap.Node2 = node2History.snapshot(now)
-				snap.Node3 = node3History.snapshot(now)
-				snap.Node4 = node4History.snapshot(now)
-				lastProbe = now
-				needUpdate = true
-			}
-			if needUpdate {
-				a.mu.Lock()
-				if snap.IPv4 == "" {
-					snap.IPv4 = a.probes.IPv4
-				}
-				if snap.IPv6 == "" {
-					snap.IPv6 = a.probes.IPv6
-				}
-				if snap.CT == (ProbeResult{}) {
-					snap.CT = a.probes.CT
-				}
-				if snap.CU == (ProbeResult{}) {
-					snap.CU = a.probes.CU
-				}
-				if snap.CM == (ProbeResult{}) {
-					snap.CM = a.probes.CM
-				}
-				if snap.BD == (ProbeResult{}) {
-					snap.BD = a.probes.BD
-				}
-				if snap.Node1 == (ProbeResult{}) {
-					snap.Node1 = a.probes.Node1
-				}
-				if snap.Node2 == (ProbeResult{}) {
-					snap.Node2 = a.probes.Node2
-				}
-				if snap.Node3 == (ProbeResult{}) {
-					snap.Node3 = a.probes.Node3
-				}
-				if snap.Node4 == (ProbeResult{}) {
-					snap.Node4 = a.probes.Node4
-				}
-				a.probes = snap
-				a.mu.Unlock()
-			}
+			runStep(now)
 		}
 	}
 }

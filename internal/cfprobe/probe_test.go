@@ -207,7 +207,7 @@ func TestBuildProbeResultCalculatesLossFromFailedSamples(t *testing.T) {
 		t.Fatalf("RTTMs = %d, want 20", got.RTTMs)
 	}
 	if got.Loss != 25 {
-		t.Fatalf("Loss = %d, want 25", got.Loss)
+		t.Fatalf("Loss = %v, want 25", got.Loss)
 	}
 }
 
@@ -220,11 +220,14 @@ func TestBuildProbeResultAllSamplesLost(t *testing.T) {
 		t.Fatalf("RTTMs = %d, want -1", got.RTTMs)
 	}
 	if got.Loss != 100 {
-		t.Fatalf("Loss = %d, want 100", got.Loss)
+		t.Fatalf("Loss = %v, want 100", got.Loss)
 	}
 }
 
-func TestRollingProbeHistoryAggregatesTwoMinuteWindow(t *testing.T) {
+func TestRollingProbeHistoryAggregatesOneMinuteWindow(t *testing.T) {
+	if metricsProbeInterval != 10*time.Second || metricsProbeMedianWindow != time.Minute || metricsProbeWindowSampleCount != 6 {
+		t.Fatalf("unexpected probe window config: interval=%s window=%s count=%d", metricsProbeInterval, metricsProbeMedianWindow, metricsProbeWindowSampleCount)
+	}
 	now := time.Unix(1000, 0)
 	history := rollingProbeHistory{}
 	results := []ProbeResult{
@@ -246,42 +249,62 @@ func TestRollingProbeHistoryAggregatesTwoMinuteWindow(t *testing.T) {
 	if got.RTTMs != 25 {
 		t.Fatalf("RTTMs = %d, want 25", got.RTTMs)
 	}
-	if got.Loss != 33 {
-		t.Fatalf("Loss = %d, want 33", got.Loss)
-	}
-}
-
-func TestRollingProbeHistoryKeepsSixSamples(t *testing.T) {
-	now := time.Unix(1000, 0)
-	history := rollingProbeHistory{}
-	history.add(now, "example.com", ProbeResult{RTTMs: -1, Loss: 100, OK: false})
-	for i := 1; i <= 6; i++ {
-		history.add(now.Add(time.Duration(i)*metricsProbeInterval), "example.com", ProbeResult{RTTMs: i * 10, OK: true})
-	}
-
-	got := history.snapshot(now.Add(6 * metricsProbeInterval))
-	if got.Loss != 0 {
-		t.Fatalf("Loss = %d, want 0", got.Loss)
+	if got.Loss != 33.33 {
+		t.Fatalf("Loss = %v, want 33.33", got.Loss)
 	}
 	if len(history.samples) != metricsProbeWindowSampleCount {
 		t.Fatalf("samples = %d, want %d", len(history.samples), metricsProbeWindowSampleCount)
 	}
 }
 
-func TestRollingProbeHistoryUsesAvailableSamplesBeforeWindowIsFull(t *testing.T) {
-	now := time.Unix(1000, 0)
-	history := rollingProbeHistory{}
-	history.add(now, "example.com", ProbeResult{RTTMs: 40, OK: true})
-	history.add(now.Add(metricsProbeInterval), "example.com", ProbeResult{RTTMs: -1, Loss: 100, OK: false})
+func TestRollingProbeHistoryExcludesStaleSamplesAndRoundsSixth(t *testing.T) {
+	now := time.Unix(2000, 0)
+	staleHistory := rollingProbeHistory{}
+	staleHistory.add(now.Add(-70*time.Second), "example.com", ProbeResult{RTTMs: -1, Loss: 100, OK: false})
+	staleHistory.add(now.Add(-20*time.Second), "example.com", ProbeResult{RTTMs: 20, Loss: 0, OK: true})
+	staleHistory.add(now.Add(-10*time.Second), "example.com", ProbeResult{RTTMs: 30, Loss: 0, OK: true})
+	staleGot := staleHistory.snapshot(now)
+	if !staleGot.OK || staleGot.Loss != 0 || staleGot.RTTMs != 25 {
+		t.Fatalf("stale exclusion got %+v, want OK=true Loss=0 RTTMs=25", staleGot)
+	}
 
-	got := history.snapshot(now.Add(metricsProbeInterval))
-	if !got.OK {
-		t.Fatal("expected available successful sample to produce an OK result")
+	sixthHistory := rollingProbeHistory{}
+	for i := 0; i < 6; i++ {
+		res := ProbeResult{RTTMs: 20, Loss: 0, OK: true}
+		if i == 3 {
+			res = ProbeResult{RTTMs: -1, Loss: 100, OK: false}
+		}
+		sixthHistory.add(now.Add(time.Duration(i)*10*time.Second), "example.com", res)
 	}
-	if got.RTTMs != 40 {
-		t.Fatalf("RTTMs = %d, want 40", got.RTTMs)
+	sixthGot := sixthHistory.snapshot(now.Add(50 * time.Second))
+	if !sixthGot.OK || sixthGot.Loss != 16.67 {
+		t.Fatalf("1/6 loss got %+v, want OK=true Loss=16.67", sixthGot)
 	}
-	if got.Loss != 50 {
-		t.Fatalf("Loss = %d, want 50", got.Loss)
+}
+
+func TestMeasureProbeFlagsTCPRetransmissionAsPacketLoss(t *testing.T) {
+	if defaultPingTimeout != 3000*time.Millisecond {
+		t.Fatalf("defaultPingTimeout = %s, want 3s", defaultPingTimeout)
+	}
+	oldTCPPing := probeTCPPing
+	t.Cleanup(func() { probeTCPPing = oldTCPPing })
+
+	latencies := []int{1200, 100}
+	calls := 0
+	probeTCPPing = func(target string, defaultPort int, timeout time.Duration) (int, error) {
+		if timeout != 3000*time.Millisecond {
+			t.Fatalf("timeout = %s, want 3s", timeout)
+		}
+		v := latencies[calls]
+		calls++
+		return v, nil
+	}
+
+	got := measureProbe(pingModeTCP, "example.com", 1, defaultMetricsTCPPort, newLogger(false))
+	if got.OK || got.RTTMs != -1 || got.Loss != 100 {
+		t.Fatalf("got %+v, want OK=false RTTMs=-1 Loss=100", got)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
 	}
 }

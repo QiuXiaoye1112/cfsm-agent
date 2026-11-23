@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	defaultPingTimeout      = 1500 * time.Millisecond
+	defaultPingTimeout      = 3000 * time.Millisecond
 	highLatencyThresholdMS  = 1000
 	pingHighLatencyRetries  = 3
 	retryDropThresholdTCPMS = 800
@@ -32,9 +33,12 @@ type dnsCacheEntry struct {
 }
 
 var (
-	dnsCacheMu sync.RWMutex
-	dnsCache   = map[string]dnsCacheEntry{}
-	lookupIP   = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	dnsCacheMu    sync.RWMutex
+	dnsCache      = map[string]dnsCacheEntry{}
+	probeTCPPing  = tcpPing
+	probeICMPPing = icmpPing
+	probeHTTPPing = httpPing
+	lookupIP      = func(ctx context.Context, host string) ([]net.IPAddr, error) {
 		resolver := net.Resolver{}
 		return resolver.LookupIPAddr(ctx, host)
 	}
@@ -245,13 +249,7 @@ func measureProbe(kind, target string, count, defaultPort int, log logger) Probe
 	ok := 0
 	values := make([]int, 0, count)
 	for i := 0; i < count; i++ {
-		var ms int
-		var err error
-		if kind == pingModeICMP {
-			ms, err = icmpPing(target, defaultPingTimeout)
-		} else {
-			ms, err = tcpPing(target, defaultPort, defaultPingTimeout)
-		}
+		ms, err := measurePingWithRetries(kind, target, defaultPingTimeout, defaultPort)
 		if err == nil {
 			ok++
 			values = append(values, ms)
@@ -273,6 +271,16 @@ func probeHistoryKey(kind, target string) string {
 	return kind + "\x00" + target
 }
 
+func roundLossPercent(lost, total int) float64 {
+	if total <= 0 || lost >= total {
+		return 100
+	}
+	if lost <= 0 {
+		return 0
+	}
+	return math.Round(float64(lost)*10000/float64(total)) / 100
+}
+
 func buildProbeResult(count int, values []int) ProbeResult {
 	if count < 1 {
 		count = 1
@@ -281,7 +289,7 @@ func buildProbeResult(count int, values []int) ProbeResult {
 	if ok == 0 {
 		return ProbeResult{RTTMs: -1, Loss: 100, OK: false}
 	}
-	return ProbeResult{RTTMs: medianInt(values), Loss: (count - ok) * 100 / count, OK: true}
+	return ProbeResult{RTTMs: medianInt(values), Loss: roundLossPercent(count-ok, count), OK: true}
 }
 
 func medianInt(values []int) int {
@@ -301,11 +309,11 @@ func measurePingWithRetries(kind, target string, timeout time.Duration, defaultP
 	return retryMeasuredPing(kind, func() (int, error) {
 		switch kind {
 		case "icmp":
-			return icmpPing(target, timeout)
+			return probeICMPPing(target, timeout)
 		case "tcp":
-			return tcpPing(target, defaultPort, timeout)
+			return probeTCPPing(target, defaultPort, timeout)
 		case "http":
-			return httpPing(target, timeout)
+			return probeHTTPPing(target, timeout)
 		default:
 			return -1, fmt.Errorf("unsupported ping type %q", kind)
 		}

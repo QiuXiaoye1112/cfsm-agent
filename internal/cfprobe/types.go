@@ -74,7 +74,7 @@ type InstallOptions struct {
 
 type ProbeResult struct {
 	RTTMs int
-	Loss  int
+	Loss  float64
 	OK    bool
 }
 
